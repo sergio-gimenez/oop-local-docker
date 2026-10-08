@@ -1,0 +1,192 @@
+# Two operators on the R2 architecture, each with its own k3s:
+#   OEG -> SRM -> tf-sdk-mock -> k3s              (local deploy)
+#   SRM -> FM  <-EWBI->  FM -> SRM -> k3s         (federation)
+# Host ports: operator A 180xx, operator B 280xx, Keycloak 18080.
+# MCC-MNC 001-01 / 001-02 are ITU test-network codes, not real operators.
+name: oop-r2
+
+x-postgres: &postgres
+  image: postgres:16-alpine
+  environment:
+    POSTGRES_PASSWORD: postgres
+  volumes:
+    - ./postgres-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+  healthcheck:
+    test: ["CMD", "pg_isready", "-U", "postgres"]
+    interval: 2s
+    retries: 30
+
+x-nats: &nats
+  image: nats:2.10-alpine
+  command: ["-js"]
+
+x-k3s: &k3s
+  image: rancher/k3s:v1.28.2-k3s1
+  privileged: true
+  tmpfs: ["/run", "/var/run"]
+
+x-tf-sdk-mock: &tf-sdk-mock
+  build: ./tf-sdk-mock
+  entrypoint: ["sh", "-c"]
+
+x-srm: &srm
+  build: ${SRM_ROOT:-./src/service-resource-manager}
+  environment: &srm-env
+    APP_NAME: Service Resource Manager
+    APP_VERSION: r2-harness
+    APP_DESCRIPTION: SRM
+    POSTGRES_SETTINGS__ECHO: "false"
+    POSTGRES_SETTINGS__CREATE_SCHEMA_ON_STARTUP: "true"
+    NATS_SETTINGS__CONNECT_TIMEOUT: "10"
+    NATS_SETTINGS__MAX_RECONNECT_ATTEMPTS: "30"
+    FEDERATION_MANAGER_SETTINGS__TIMEOUT: "5"
+    TF_SDK_SETTINGS__ENABLED: "true"
+
+x-oeg: &oeg
+  build:
+    context: ${OEG_ROOT:-./src/open-exposure-gateway}
+    # OEG's own Dockerfile pip-installs without its uv.lock and now resolves SQLAlchemy 2.1,
+    # which no longer brings greenlet, so the app crashes on import. Same build, pinned
+    # to what the lock tests with, until OEG fixes it.
+    dockerfile_inline: |
+      FROM python:3.12-slim
+      WORKDIR /app
+      COPY pyproject.toml README.md ./
+      COPY src/ ./src/
+      RUN python -m venv .venv && .venv/bin/pip install --no-cache-dir . "sqlalchemy[asyncio]>=2.0.48,<2.1"
+      ENV PATH="/app/.venv/bin:$PATH" PYTHONPATH=/app PYTHONUNBUFFERED=1
+      EXPOSE 8080
+      CMD ["uvicorn", "open_exposure_gateway.main:app", "--host", "0.0.0.0", "--port", "8080"]
+  environment: &oeg-env
+    POSTGRESQL_SETTINGS__CREATE_SCHEMA_ON_STARTUP: "true"
+
+x-fm: &fm
+  build: ${FM_ROOT:-./src/federation-manager}
+  volumes:
+    - ./secrets:/secrets:ro
+  environment: &fm-env
+    FM_KEYCLOAK_ISSUER: http://keycloak:8080/realms/federation
+    FM_COUNTRY_CODE: ES
+    FM_ALLOW_INSECURE_PARTNER_ENDPOINTS: "true"
+
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.1.4
+    # One hostname in every token, whoever asks, so FM's issuer check holds.
+    command: ["start-dev", "--import-realm", "--hostname=http://keycloak:8080"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HEALTH_ENABLED: "true"
+    volumes:
+      - ${FM_ROOT:-./src/federation-manager}/keycloak/realm-import.json:/opt/keycloak/data/import/federation.json:ro
+    ports: ["18080:8080"]
+
+  # ---------------- operator A ----------------
+  postgres-a: *postgres
+  nats-a: *nats
+  k3s-a:
+    <<: *k3s
+    command: ["server", "--disable=traefik,metrics-server,local-storage", "--tls-san=k3s-a",
+              "--write-kubeconfig-mode=644", "--write-kubeconfig=/out/kubeconfig.yaml"]
+    volumes: ["k3s-a-out:/out"]
+  tf-sdk-mock-a:
+    <<: *tf-sdk-mock
+    command: ["until [ -s /k3s/kubeconfig.yaml ]; do sleep 1; done;
+               sed 's#https://127.0.0.1:6443#https://k3s-a:6443#' /k3s/kubeconfig.yaml > /tmp/kube.yaml;
+               KUBECONFIG=/tmp/kube.yaml exec uvicorn app:app --host 0.0.0.0 --port 8090"]
+    volumes: ["k3s-a-out:/k3s:ro"]
+  srm-a:
+    <<: *srm
+    environment:
+      <<: *srm-env
+      POSTGRES_SETTINGS__URL: postgresql+asyncpg://postgres:postgres@postgres-a:5432/srm
+      NATS_SETTINGS__URL: nats://nats-a:4222
+      FEDERATION_MANAGER_SETTINGS__BASE_URL: http://fm-a:8082
+      TF_SDK_SETTINGS__BASE_URL: http://tf-sdk-mock-a:8090
+      ZONE_PROVIDER_NAME: operator-a
+    depends_on: {postgres-a: {condition: service_healthy}, nats-a: {condition: service_started}}
+    ports: ["18082:8080"]
+  oeg-a:
+    <<: *oeg
+    environment:
+      <<: *oeg-env
+      SRM_SETTINGS__BASE_URL: http://srm-a:8080
+      FM_SETTINGS__BASE_URL: http://fm-a:8082
+      POSTGRESQL_SETTINGS__URL: postgresql+asyncpg://postgres:postgres@postgres-a:5432/oeg
+      NATS_SETTINGS__URL: nats://nats-a:4222
+      PUBLIC_BASE_URL: http://localhost:18081
+    depends_on: {postgres-a: {condition: service_healthy}, srm-a: {condition: service_started}}
+    ports: ["18081:8080"]
+  fm-a:
+    <<: *fm
+    environment:
+      <<: *fm-env
+      FM_POSTGRES_URL: postgresql+asyncpg://postgres:postgres@postgres-a:5432/fm
+      FM_NATS_URL: nats://nats-a:4222
+      FM_SRM_INTERNAL_URL: http://srm-a:8080
+      FM_FEDERATION_ID: operator-a
+      FM_MCC: "001"
+      FM_MNCS: '["01"]'
+      FM_PARTNER_STATUS_LINK: http://fm-a:8082/operatorplatform/federation/v1/callbacks/partner-status
+      FM_AVAIL_ZONE_NOTIF_LINK: http://fm-a:8082/operatorplatform/federation/v1/callbacks/zone-resource
+      FM_INSTANCE_STATUS_LINK: http://fm-a:8082/operatorplatform/federation/v1/callbacks/instance-status
+    depends_on: {postgres-a: {condition: service_healthy}, keycloak: {condition: service_started}}
+    ports: ["18083:8082"]
+
+  # ---------------- operator B ----------------
+  postgres-b: *postgres
+  nats-b: *nats
+  k3s-b:
+    <<: *k3s
+    command: ["server", "--disable=traefik,metrics-server,local-storage", "--tls-san=k3s-b",
+              "--write-kubeconfig-mode=644", "--write-kubeconfig=/out/kubeconfig.yaml"]
+    volumes: ["k3s-b-out:/out"]
+  tf-sdk-mock-b:
+    <<: *tf-sdk-mock
+    command: ["until [ -s /k3s/kubeconfig.yaml ]; do sleep 1; done;
+               sed 's#https://127.0.0.1:6443#https://k3s-b:6443#' /k3s/kubeconfig.yaml > /tmp/kube.yaml;
+               KUBECONFIG=/tmp/kube.yaml exec uvicorn app:app --host 0.0.0.0 --port 8090"]
+    volumes: ["k3s-b-out:/k3s:ro"]
+  srm-b:
+    <<: *srm
+    environment:
+      <<: *srm-env
+      POSTGRES_SETTINGS__URL: postgresql+asyncpg://postgres:postgres@postgres-b:5432/srm
+      NATS_SETTINGS__URL: nats://nats-b:4222
+      FEDERATION_MANAGER_SETTINGS__BASE_URL: http://fm-b:8082
+      TF_SDK_SETTINGS__BASE_URL: http://tf-sdk-mock-b:8090
+      ZONE_PROVIDER_NAME: operator-b
+    depends_on: {postgres-b: {condition: service_healthy}, nats-b: {condition: service_started}}
+    ports: ["28082:8080"]
+  oeg-b:
+    <<: *oeg
+    environment:
+      <<: *oeg-env
+      SRM_SETTINGS__BASE_URL: http://srm-b:8080
+      FM_SETTINGS__BASE_URL: http://fm-b:8082
+      POSTGRESQL_SETTINGS__URL: postgresql+asyncpg://postgres:postgres@postgres-b:5432/oeg
+      NATS_SETTINGS__URL: nats://nats-b:4222
+      PUBLIC_BASE_URL: http://localhost:28081
+    depends_on: {postgres-b: {condition: service_healthy}, srm-b: {condition: service_started}}
+    ports: ["28081:8080"]
+  fm-b:
+    <<: *fm
+    environment:
+      <<: *fm-env
+      FM_POSTGRES_URL: postgresql+asyncpg://postgres:postgres@postgres-b:5432/fm
+      FM_NATS_URL: nats://nats-b:4222
+      FM_SRM_INTERNAL_URL: http://srm-b:8080
+      FM_FEDERATION_ID: operator-b
+      FM_COUNTRY_CODE: FR
+      FM_MCC: "001"
+      FM_MNCS: '["02"]'
+      FM_PARTNER_STATUS_LINK: http://fm-b:8082/operatorplatform/federation/v1/callbacks/partner-status
+      FM_AVAIL_ZONE_NOTIF_LINK: http://fm-b:8082/operatorplatform/federation/v1/callbacks/zone-resource
+      FM_INSTANCE_STATUS_LINK: http://fm-b:8082/operatorplatform/federation/v1/callbacks/instance-status
+    depends_on: {postgres-b: {condition: service_healthy}, keycloak: {condition: service_started}}
+    ports: ["28083:8082"]
+
+volumes:
+  k3s-a-out:
+  k3s-b-out:
